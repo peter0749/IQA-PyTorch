@@ -281,6 +281,14 @@ DEFAULT_CONFIGS = OrderedDict({
         },
         'metric_mode': 'NR',
     },
+    'xclipiqa': {
+        'metric_opts': {
+            'type': 'XCLIPIQA',
+            'backbone': 'RN50',
+            'pos_embedding': False,
+        },
+        'metric_mode': 'NR',
+    },
     'clipiqa+': {
         'metric_opts': {
             'type': 'CLIPIQA',

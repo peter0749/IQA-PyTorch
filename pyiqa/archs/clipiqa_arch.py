@@ -135,7 +135,7 @@ class CLIPIQA(nn.Module):
 
         for p in self.clip_model[0].parameters():
             p.requires_grad = False
-        
+
         if pretrained and 'clipiqa+' in model_type:
             if model_type == 'clipiqa+' and backbone == 'RN50':
                 self.prompt_learner.ctx.data = torch.load(load_file_from_url(default_model_urls['clipiqa+']))
@@ -143,7 +143,7 @@ class CLIPIQA(nn.Module):
                 load_pretrained_network(self, default_model_urls[model_type], True, 'params')
             else:
                 raise(f'No pretrained model for {model_type}')
-    
+
     def forward(self, x):
         # preprocess image
         x = (x - self.default_mean.to(x)) / self.default_std.to(x)
@@ -160,3 +160,63 @@ class CLIPIQA(nn.Module):
         probs = logits_per_image.reshape(logits_per_image.shape[0], -1, 2).softmax(dim=-1)
 
         return probs[..., 0].mean(dim=1, keepdim=True)
+
+
+@ARCH_REGISTRY.register()
+class XCLIPIQA(nn.Module):
+    def __init__(self,
+                 overall_iq_w=0.25,
+                 backbone='RN50',
+                 pretrained=True,
+                 pos_embedding=False,
+                 ) -> None:
+        super().__init__()
+
+        self.clip_model = [load(backbone, 'cpu')]  # avoid saving clip weights
+        # Different from original paper, we assemble multiple prompts to improve performance
+        self.prompt_pairs = clip.tokenize([
+            "Good photo.", "Bad photo.",
+            "Good bright photo.", "Bad dark photo.",
+            "Good contrast photo.", "Bad low contrast photo.",
+            "Good sharp edge.", "Bad blurry edge.",
+            "Sharp image.", "Blurry image.",
+            "Good accurate color white balance.", "Bad color white balance cast.",
+            "Good natural face color.", "Bad face color cast.",
+        ])
+
+        self.pos_embedding = pos_embedding
+
+        self.default_mean = torch.Tensor(OPENAI_CLIP_MEAN).view(1, 3, 1, 1)
+        self.default_std = torch.Tensor(OPENAI_CLIP_STD).view(1, 3, 1, 1)
+        self.overall_iq_w = overall_iq_w
+
+        for p in self.clip_model[0].parameters():
+            p.requires_grad = False
+
+    def forward(self, x):
+        # preprocess image
+        x = (x - self.default_mean.to(x)) / self.default_std.to(x)
+        clip_model = self.clip_model[0].to(x)
+
+        text = self.prompt_pairs.to(x.device)
+        image = x
+
+        with torch.no_grad():
+            text_features = clip_model.encode_text(text)
+            image_features = clip_model.encode_image(image, pos_embedding=self.pos_embedding)
+            text_vector = text_features[::2] - text_features[1::2]
+
+            v_text = text_vector[:1]
+            U = text_vector[1:]
+            v2_text = v_text @ v_text.T
+            Uv_text = U @ v_text.T
+            mag_text = (Uv_text / v2_text)
+
+            img_vector = image_features.unsqueeze(1) - text_features[1::2].unsqueeze(0)
+            text_vector2 = (torch.norm(text_vector, dim=1)**2)[None,...,None]
+
+            Uv_img = (img_vector * text_vector).sum(2, keepdim=True)
+            mag_img = (Uv_img / text_vector2)
+
+            scores = torch.sum(mag_text[None] * mag_img[:,1:], 1) + self.overall_iq_w * mag_img[:,0]
+            return scores
