@@ -38,12 +38,20 @@ class PromptLearner(nn.Module):
             3. Insert the original text embedding at the middle
     """
 
-    def __init__(self, clip_model, n_ctx=16) -> None:
+    def __init__(self, clip_model, n_ctx=16, prompts=None) -> None:
         super().__init__()
 
         # For the following codes about prompts, we follow the official codes to get the same results
         prompt_prefix = " ".join(["X"] * n_ctx) + ' '
-        init_prompts = [prompt_prefix + 'Good photo..', prompt_prefix + 'Bad photo..']
+
+        if prompts is None:
+            prompts = ['Good photo.', 'Bad photo.']
+
+        with torch.no_grad():
+            tok = clip.tokenize(prompts)
+            self.name_lens = list((tok.argmax(1) - 1).cpu().numpy())
+
+        init_prompts = [(prompt_prefix + x + '.') for x in prompts]
         with torch.no_grad():
             txt_token = clip.tokenize(init_prompts)
             self.tokenized_prompts = txt_token
@@ -55,7 +63,6 @@ class PromptLearner(nn.Module):
         self.n_ctx = n_ctx
 
         self.n_cls = len(init_prompts)
-        self.name_lens = [3, 3]  # hard coded length, which does not include the extra "." at the end
 
         self.register_buffer("token_prefix", init_embedding[:, :1, :])  # SOS
         self.register_buffer("token_suffix", init_embedding[:, 1 + n_ctx:, :])  # CLS, EOS
@@ -166,6 +173,7 @@ class CLIPIQA(nn.Module):
 class XCLIPIQA(nn.Module):
     def __init__(self,
                  overall_iq_w=0.25,
+                 model_type='clipiqa+',
                  backbone='RN50',
                  pretrained=True,
                  pos_embedding=False,
@@ -174,7 +182,7 @@ class XCLIPIQA(nn.Module):
 
         self.clip_model = [load(backbone, 'cpu')]  # avoid saving clip weights
         # Different from original paper, we assemble multiple prompts to improve performance
-        self.prompt_pairs = clip.tokenize([
+        self.prompts_txt_list = [
             "Good photo.", "Bad photo.",
             "Good bright photo.", "Bad dark photo.",
             "Good contrast photo.", "Bad low contrast photo.",
@@ -182,7 +190,12 @@ class XCLIPIQA(nn.Module):
             "Sharp image.", "Blurry image.",
             "Good accurate color white balance.", "Bad color white balance cast.",
             "Good natural face color.", "Bad face color cast.",
-        ])
+        ]
+        self.prompt_pairs = clip.tokenize(self.prompts_txt_list)
+
+        self.model_type = model_type
+        if 'clipiqa+' in self.model_type:
+            self.prompt_learner = PromptLearner(self.clip_model[0], prompts=self.prompts_txt_list)
 
         self.pos_embedding = pos_embedding
 
@@ -198,25 +211,28 @@ class XCLIPIQA(nn.Module):
         x = (x - self.default_mean.to(x)) / self.default_std.to(x)
         clip_model = self.clip_model[0].to(x)
 
-        text = self.prompt_pairs.to(x.device)
         image = x
 
-        with torch.no_grad():
+        if 'clipiqa+' in self.model_type:
+            text_features = self.prompt_learner(clip_model)
+        else:
+            text = self.prompt_pairs.to(x.device)
             text_features = clip_model.encode_text(text)
-            image_features = clip_model.encode_image(image, pos_embedding=self.pos_embedding)
-            text_vector = text_features[::2] - text_features[1::2]
 
-            v_text = text_vector[:1]
-            U = text_vector[1:]
-            v2_text = v_text @ v_text.T
-            Uv_text = U @ v_text.T
-            mag_text = (Uv_text / v2_text)
+        image_features = clip_model.encode_image(image, pos_embedding=self.pos_embedding)
+        text_vector = text_features[::2] - text_features[1::2]
 
-            img_vector = image_features.unsqueeze(1) - text_features[1::2].unsqueeze(0)
-            text_vector2 = (torch.norm(text_vector, dim=1)**2)[None,...,None]
+        v_text = text_vector[:1]
+        U = text_vector[1:]
+        v2_text = v_text @ v_text.T
+        Uv_text = U @ v_text.T
+        mag_text = (Uv_text / v2_text)
 
-            Uv_img = (img_vector * text_vector).sum(2, keepdim=True)
-            mag_img = (Uv_img / text_vector2)
+        img_vector = image_features.unsqueeze(1) - text_features[1::2].unsqueeze(0)
+        text_vector2 = (torch.norm(text_vector, dim=1)**2)[None,...,None]
 
-            scores = torch.sum(mag_text[None] * mag_img[:,1:], 1) + self.overall_iq_w * mag_img[:,0]
-            return scores
+        Uv_img = (img_vector * text_vector).sum(2, keepdim=True)
+        mag_img = (Uv_img / text_vector2)
+
+        scores = torch.sum(mag_text[None] * mag_img[:,1:], 1) + self.overall_iq_w * mag_img[:,0]
+        return scores
